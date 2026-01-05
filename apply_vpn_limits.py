@@ -16,9 +16,8 @@ def parse_wg_conf(conf_path):
     for line in lines:
         line = line.strip()
 
-        # Захватываем комментарий с именем клиента
+        # Захватываем имя клиента из комментария
         if line.startswith('#'):
-            # Поддерживаем форматы: # Client: VIP_my_pc, # VIP_my_pc, # имя
             match = re.search(r'#\s*(Client:\s*)?(.+)', line, re.IGNORECASE)
             if match:
                 current_name = match.group(2).strip()
@@ -27,13 +26,12 @@ def parse_wg_conf(conf_path):
             if current_peer:
                 peers.append(current_peer)
             current_peer = {'name': current_name}
-            current_name = None  # сбрасываем после использования
+            current_name = None
 
-        elif '=' in line and current_peer is not None:
+        elif '=' in line and 'current_peer' in locals():
             key, value = line.split('=', 1)
             current_peer[key.strip()] = value.strip()
 
-    # Не забываем последний пир
     if current_peer:
         peers.append(current_peer)
 
@@ -41,37 +39,38 @@ def parse_wg_conf(conf_path):
 
 
 def is_unlimited(name):
-    """Проверяет, содержит ли имя клиента 'VIP' (регистр не важен)."""
+    """Если в имени клиента есть VIP (регистр не важен) — безлимит."""
     return name and 'VIP' in name.upper()
 
 
 def setup_tc(interface, peers, limit_rate='32mbit', total_rate='1000mbit'):
-    """Применяет правила tc с HTB + IFB для ограничения upload/download per IP."""
+    """Применяет ограничение скорости с помощью tc + HTB + IFB."""
     ifb = 'ifb0'
 
     # Очистка старых правил
     subprocess.run(['tc', 'qdisc', 'del', 'dev', interface, 'root'], check=False)
     subprocess.run(['tc', 'qdisc', 'del', 'dev', interface, 'ingress'], check=False)
     subprocess.run(['tc', 'qdisc', 'del', 'dev', ifb, 'root'], check=False)
+    subprocess.run(['ip', 'link', 'del', 'dev', ifb], check=False)
 
-    # Активация IFB для ingress (download от клиента к серверу)
+    # Активируем IFB-модуль и интерфейс
     subprocess.run(['modprobe', 'ifb'], check=False)
-    subprocess.run(['ip', 'link', 'set', 'dev', ifb, 'down'], check=False)
-    subprocess.run(['ip', 'link', 'set', 'dev', ifb, 'up'], check=False)
+    subprocess.run(['ip', 'link', 'add', 'name', ifb, 'type', 'ifb'], check=False)
+    subprocess.run(['ip', 'link', 'set', 'dev', ifb, 'up'], check=True)
 
-    # Перенаправляем ingress трафик на IFB
-    subprocess.run(['tc', 'qdisc', 'add', 'dev', interface, 'ingress', 'handle', 'ffff:', 'filter'], check=True)
+    # Ingress: перенаправляем входящий трафик на ifb0
+    subprocess.run(['tc', 'qdisc', 'add', 'dev', interface, 'ingress', 'handle', 'ffff:', 'ingress'], check=True)
     subprocess.run([
         'tc', 'filter', 'add', 'dev', interface, 'parent', 'ffff:',
         'protocol', 'ip', 'u32', 'match', 'u32', '0', '0',
         'action', 'mirred', 'egress', 'redirect', 'dev', ifb
     ], check=True)
 
-    # Egress (upload: от сервера к клиенту)
+    # Egress (upload от сервера к клиенту)
     subprocess.run(['tc', 'qdisc', 'add', 'dev', interface, 'root', 'handle', '1:', 'htb', 'default', '1'], check=True)
     subprocess.run(['tc', 'class', 'add', 'dev', interface, 'parent', '1:', 'classid', '1:1', 'htb', 'rate', total_rate, 'ceil', total_rate], check=True)
 
-    # Ingress на IFB (download)
+    # Ingress на ifb0 (download от клиента к серверу)
     subprocess.run(['tc', 'qdisc', 'add', 'dev', ifb, 'root', 'handle', '1:', 'htb', 'default', '1'], check=True)
     subprocess.run(['tc', 'class', 'add', 'dev', ifb, 'parent', '1:', 'classid', '1:1', 'htb', 'rate', total_rate, 'ceil', total_rate], check=True)
 
@@ -80,13 +79,14 @@ def setup_tc(interface, peers, limit_rate='32mbit', total_rate='1000mbit'):
         if 'AllowedIPs' not in peer:
             continue
 
-        ip = peer['AllowedIPs'].split(',')[0].split('/')[0].strip()  # Берём первый IP (обычно /32)
+        # Берём первый IP (обычно x.x.x.x/32)
+        ip = peer['AllowedIPs'].split(',')[0].split('/')[0].strip()
         name = peer.get('name', '')
 
         if is_unlimited(name):
-            continue  # Безлимитные — пропускаем
+            continue  # VIP — без ограничений
 
-        # Egress: ограничение по dst IP (трафик к клиенту)
+        # Ограничение upload (по dst IP)
         subprocess.run([
             'tc', 'class', 'add', 'dev', interface, 'parent', '1:1',
             'classid', f'1:{class_id}', 'htb', 'rate', limit_rate, 'ceil', limit_rate
@@ -97,7 +97,7 @@ def setup_tc(interface, peers, limit_rate='32mbit', total_rate='1000mbit'):
             'flowid', f'1:{class_id}'
         ], check=True)
 
-        # Ingress на IFB: ограничение по src IP (трафик от клиента)
+        # Ограничение download (по src IP на ifb0)
         subprocess.run([
             'tc', 'class', 'add', 'dev', ifb, 'parent', '1:1',
             'classid', f'1:{class_id}', 'htb', 'rate', limit_rate, 'ceil', limit_rate
@@ -113,18 +113,20 @@ def setup_tc(interface, peers, limit_rate='32mbit', total_rate='1000mbit'):
 
 if __name__ == '__main__':
     conf_path = '/opt/amnezia/awg/wg0.conf'   # Путь внутри контейнера
-    interface = 'wg0'                         # Интерфейс внутри контейнера
+    interface = 'wg0'
 
     if not os.path.exists(conf_path):
-        print(f"Ошибка: Конфиг не найден по пути {conf_path}")
+        print(f"ОШИБКА: Файл конфига не найден: {conf_path}")
         exit(1)
 
     peers = parse_wg_conf(conf_path)
+    print(f"Найдено {len(peers)} клиентов.")
+
     setup_tc(interface, peers)
 
-    # Применяем изменения конфига без рестарта (важно для новых пользователей)
+    # Применяем изменения WireGuard без рестарта
     subprocess.run(['wg', 'syncconf', interface, conf_path], check=True)
 
-    print("Лимиты скорости успешно применены.")
-    print("Безлимитные (с VIP в имени): пропущены.")
-    print("Остальные: ограничены до 32 Мбит/с в обе стороны.")
+    print("Лимиты скорости успешно применены!")
+    print("• Клиенты с VIP в имени — без ограничений")
+    print("• Остальные — максимум 32 Мбит/с (upload + download)")
