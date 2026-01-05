@@ -1,50 +1,57 @@
 #!/bin/bash
 
 # =====================================================
-# Amnezia VPN — ограничение скорости
-# Лимит 32 Мбит/с только для обычных пользователей (подсеть OpenVPN over Cloak)
-# Админы на AmneziaWG (подсеть 10.8.1.0/24) — автоматически полная скорость
+# Amnezia VPN — ограничение скорости 32 Мбит/с per-user для обычных (OpenVPN подсеть)
+# Админы на AmneziaWG (10.8.1.0/24) — полная скорость автоматически
+# Используем hash-table для правильного матча подсети
 # =====================================================
 
 # ========== НАСТРОЙКИ ==========
-LIMIT_RATE="32mbit"                  # скорость для обычных (можно изменить)
+LIMIT_RATE="32mbit"                  # скорость для каждого обычного пользователя
 
-INTERFACE="eth0"                     # внешний интерфейс (если не eth0 — проверь ip a и измени)
+INTERFACE="eth0"                     # внешний интерфейс (если не eth0 — измени после ip a)
 
-VPN_SUBNET="10.8.0.0/24"             # подсеть обычных пользователей (OpenVPN over Cloak)
+VPN_SUBNET="10.8.0.0/24"             # подсеть обычных (OpenVPN over Cloak)
 # =====================================================
 
 set -e
 
 apply_limits() {
-    echo "Применяю лимит $LIMIT_RATE на подсеть $VPN_SUBNET..."
+    echo "Применяю per-user лимит $LIMIT_RATE на подсеть $VPN_SUBNET..."
 
     modprobe ifb || true
     ip link add ifb0 type ifb 2>/dev/null || true
     ip link set ifb0 up
 
-    # Очистка старых правил
+    # Очистка
     tc qdisc del dev $INTERFACE root 2>/dev/null || true
     tc qdisc del dev $INTERFACE ingress 2>/dev/null || true
     tc qdisc del dev ifb0 root 2>/dev/null || true
 
-    # DOWNLOAD (трафик с сервера к клиентам)
+    # Создаём hash-table для подсети (divisor 256 — достаточно для /24)
+    tc filter add dev $INTERFACE parent ffff: protocol ip u32 divisor 256
+    tc filter add dev $INTERFACE protocol ip parent 1: prio 1 u32 \
+        ht 800:: \
+        match ip src $VPN_SUBNET \
+        hashkey mask 0x000000ff at 16 \
+        link 1::
+
+    # DOWNLOAD
     tc qdisc add dev $INTERFACE root handle 1: htb default 9999
     tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 1000mbit
-    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate $LIMIT_RATE ceil $LIMIT_RATE
-    tc filter add dev $INTERFACE protocol ip parent 1: prio 1 u32 match ip src $VPN_SUBNET flowid 1:10
+    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate $LIMIT_RATE ceil $LIMIT_RATE prio 1
+    tc filter add dev $INTERFACE protocol ip parent 1: prio 1 handle 1: u32 flowid 1:10
 
-    # UPLOAD (трафик от клиентов к серверу)
+    # UPLOAD
     tc qdisc add dev $INTERFACE handle ffff: ingress
     tc filter add dev $INTERFACE parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
-    tc qdisc add dev ifb0 root handle 1: htb default 9999
-    tc class add dev ifb0 parent 1: classid 1:1 htb rate 1000mbit
-    tc class add dev ifb0 parent 1:1 classid 1:10 htb rate $LIMIT_RATE ceil $LIMIT_RATE
-    tc filter add dev ifb0 protocol ip parent 1: prio 1 u32 match ip dst $VPN_SUBNET flowid 1:10
+    tc qdisc add dev ifb0 root handle 2: htb default 9999
+    tc class add dev ifb0 parent 2: classid 2:1 htb rate 1000mbit
+    tc class add dev ifb0 parent 2:1 classid 2:10 htb rate $LIMIT_RATE ceil $LIMIT_RATE prio 1
+    tc filter add dev ifb0 protocol ip parent 2: prio 1 handle 1: u32 flowid 2:10
 
-    echo "Лимит применён успешно!"
-    echo "Обычные пользователи ($VPN_SUBNET): ≤ $LIMIT_RATE каждый (независимо)"
-    echo "Админы (10.8.1.0/24): полная скорость"
+    echo "Лимит применён успешно! Каждый обычный пользователь — ≤ $LIMIT_RATE независимо."
+    echo "Админы (AmneziaWG): полная скорость."
 }
 
 remove_limits() {
@@ -62,8 +69,6 @@ install_autostart() {
     if ! crontab -l 2>/dev/null | grep -q "$script_path apply"; then
         (crontab -l 2>/dev/null; echo "@reboot $script_path apply") | crontab -
         echo "Автозагрузка добавлена."
-    else
-        echo "Автозагрузка уже настроена."
     fi
 }
 
