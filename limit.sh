@@ -1,60 +1,43 @@
 #!/bin/bash
 
 # =====================================================
-# Amnezia VPN — per-user лимит скорости 32 Мбит/с для обычных пользователей (OpenVPN подсеть)
-# Админы на AmneziaWG (10.8.1.0/24) — полная скорость
-# Простой и стабильный вариант без hash (для /24 работает)
+# Amnezia VPN — лимит скорости 32 Мбит/с на DOWNLOAD для обычных пользователей (OpenVPN подсеть 10.8.0.0/24)
+# Админы на AmneziaWG (10.8.1.0/24) — полная скорость автоматически
+# Только egress shaping (download для клиентов) — без ingress (чтобы избежать ошибок)
 # =====================================================
 
 # ========== НАСТРОЙКИ ==========
-LIMIT_RATE="32mbit"                  # скорость для каждого обычного пользователя
+LIMIT_RATE="32mbit"                  # скорость download для каждого обычного пользователя
 
-INTERFACE="eth0"                     # внешний интерфейс (проверь ip a, если не eth0 — измени)
-
-VPN_SUBNET="10.8.0.0/24"             # подсеть обычных пользователей (OpenVPN over Cloak)
+INTERFACE="eth0"                     # внешный интерфейс (если не eth0 — проверь ip a и измени)
 # =====================================================
 
 set -e
 
 apply_limits() {
-    echo "Применяю per-user лимит $LIMIT_RATE на подсеть $VPN_SUBNET..."
+    echo "Применяю лимит $LIMIT_RATE на download для обычных пользователей..."
 
-    modprobe ifb || true
-    ip link add ifb0 type ifb 2>/dev/null || true
-    ip link set ifb0 up
-
-    # Очистка всех правил
+    # Очистка
     tc qdisc del dev $INTERFACE root 2>/dev/null || true
-    tc qdisc del dev $INTERFACE ingress 2>/dev/null || true
-    tc qdisc del dev ifb0 root 2>/dev/null || true
 
-    # === DOWNLOAD (с сервера к клиентам) ===
+    # HTB для egress (download для клиентов = upload с сервера)
     tc qdisc add dev $INTERFACE root handle 1: htb default 9999
     tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 1000mbit
     tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate $LIMIT_RATE ceil $LIMIT_RATE
-    tc filter add dev $INTERFACE protocol ip parent 1: prio 1 u32 match ip src $VPN_SUBNET flowid 1:10
 
-    # === UPLOAD (от клиентов к серверу) ===
-    tc qdisc add dev $INTERFACE handle ffff: ingress
-    tc filter add dev $INTERFACE parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
-    tc qdisc add dev ifb0 root handle 1: htb default 9999
-    tc class add dev ifb0 parent 1: classid 1:1 htb rate 1000mbit
-    tc class add dev ifb0 parent 1:1 classid 1:10 htb rate $LIMIT_RATE ceil $LIMIT_RATE
-    tc filter add dev ifb0 protocol ip parent 1: prio 1 u32 match ip dst $VPN_SUBNET flowid 1:10
+    # Фильтр на всю подсеть OpenVPN (per-user автоматически через HTB)
+    tc filter add dev $INTERFACE protocol ip parent 1: prio 1 u32 match ip src 10.8.0.0/24 flowid 1:10
 
-    echo "Лимит применён успешно!"
-    echo "Каждый обычный пользователь: ≤ $LIMIT_RATE (независимо друг от друга)"
-    echo "Админы (AmneziaWG): полная скорость"
+    echo "Лимит на download применён успешно!"
+    echo "Каждый обычный пользователь: ≤ $LIMIT_RATE на download"
+    echo "Upload — без лимита (полная скорость)"
+    echo "Админы (AmneziaWG): полная скорость в обе стороны"
 }
 
 remove_limits() {
-    echo "Снимаю все ограничения..."
+    echo "Снимаю лимит..."
     tc qdisc del dev $INTERFACE root 2>/dev/null || true
-    tc qdisc del dev $INTERFACE ingress 2>/dev/null || true
-    tc qdisc del dev ifb0 root 2>/dev/null || true
-    ip link set ifb0 down 2>/dev/null || true
-    ip link del ifb0 2>/dev/null || true
-    echo "Все правила удалены."
+    echo "Правила удалены."
 }
 
 install_autostart() {
