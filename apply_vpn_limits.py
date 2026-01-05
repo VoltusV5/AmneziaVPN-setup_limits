@@ -39,11 +39,9 @@ def is_unlimited(name):
     return name and 'VIP' in name.upper()
 
 def setup_tc_egress_only(interface, peers, limit_rate='32mbit', total_rate='1000mbit'):
-    """Ограничиваем только egress (upload от сервера к клиентам, т.е. download клиентов)."""
-    # Очистка старых правил только на root (egress)
+    """Ограничиваем только download клиентов (egress трафик сервера)."""
     subprocess.run(['tc', 'qdisc', 'del', 'dev', interface, 'root'], check=False)
 
-    # HTB на egress
     subprocess.run(['tc', 'qdisc', 'add', 'dev', interface, 'root', 'handle', '1:', 'htb', 'default', '1'], check=True)
     subprocess.run(['tc', 'class', 'add', 'dev', interface, 'parent', '1:', 'classid', '1:1', 'htb', 'rate', total_rate, 'ceil', total_rate], check=True)
 
@@ -56,15 +54,13 @@ def setup_tc_egress_only(interface, peers, limit_rate='32mbit', total_rate='1000
         name = peer.get('name', '')
 
         if is_unlimited(name):
-            continue  # VIP — без лимита
+            continue
 
-        # Класс с ограничением
         subprocess.run([
             'tc', 'class', 'add', 'dev', interface, 'parent', '1:1',
             'classid', f'1:{class_id}', 'htb', 'rate', limit_rate, 'ceil', limit_rate
         ], check=True)
 
-        # Фильтр по dst IP (трафик к клиенту)
         subprocess.run([
             'tc', 'filter', 'add', 'dev', interface, 'parent', '1:',
             'protocol', 'ip', 'u32', 'match', 'ip', 'dst', ip,
@@ -86,9 +82,8 @@ if __name__ == '__main__':
 
     setup_tc_egress_only(interface, peers)
 
-    subprocess.run(['wg', 'syncconf', interface, conf_path], check=True)
-
-    print("Лимиты успешно применены!")
-    print("• Только download клиентов ограничен (32 Мбит/с для non-VIP)")
-    print("• Upload клиентов (их download) — без ограничений")
-    print("• VIP-клиенты — полный безлимит")
+    # Убрали wg syncconf — он не нужен в AmneziaWG и вызывает ошибку
+    print("Лимиты скорости успешно применены!")
+    print("• Download клиентов ограничен до 32 Мбит/с для обычных пользователей")
+    print("• VIP-клиенты (с VIP в имени) — без ограничений")
+    print("• Upload клиентов — без ограничений (из-за ограничений Docker)")
